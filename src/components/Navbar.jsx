@@ -4,7 +4,10 @@ import {
   Ruler, 
   Cloud, 
   Download, 
-  Database
+  Database,
+  User,
+  LogOut,
+  LogIn
 } from 'lucide-react';
 
 export default function Navbar({ 
@@ -13,6 +16,8 @@ export default function Navbar({
   onOpenSupabase, 
   isSupabaseConnected, 
   supabaseUser,
+  onOpenAuth,
+  onSignOut,
   onExportCSV,
   measurementsCount
 }) {
@@ -44,7 +49,7 @@ export default function Navbar({
         </div>
 
         {/* Right Action Controls */}
-        <div className="flex items-center gap-2 sm:gap-3">
+        <div className="flex items-center gap-2 sm:gap-2.5">
           
           {/* Height Pill / Quick Profile Edit */}
           <button
@@ -60,28 +65,15 @@ export default function Navbar({
           {/* Supabase Status & Settings Button */}
           <button
             onClick={onOpenSupabase}
-            title="Configuración de sincronización en la nube con Supabase"
-            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs font-medium transition-all ${
+            title="Configuración de conexión y tablas en Supabase"
+            className={`hidden md:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-medium transition-all ${
               isSupabaseConnected 
                 ? 'bg-emerald-950/40 border-emerald-500/30 text-emerald-300 hover:bg-emerald-900/40' 
                 : 'bg-slate-900/90 border-slate-700/60 text-slate-300 hover:bg-slate-800 hover:border-slate-600'
             }`}
           >
-            {isSupabaseConnected ? (
-              <>
-                <span className="relative flex h-2 w-2">
-                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                  <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-400"></span>
-                </span>
-                <span className="hidden md:inline">Supabase Conectado</span>
-                <Database className="w-3.5 h-3.5 text-emerald-400" />
-              </>
-            ) : (
-              <>
-                <Cloud className="w-3.5 h-3.5 text-slate-400" />
-                <span className="hidden sm:inline">Nube / Supabase</span>
-              </>
-            )}
+            <Database className={`w-3.5 h-3.5 ${isSupabaseConnected ? 'text-emerald-400' : 'text-slate-400'}`} />
+            <span className="text-[11px]">{isSupabaseConnected ? 'Supabase' : 'Nube'}</span>
           </button>
 
           {/* Quick Export to CSV */}
@@ -89,11 +81,44 @@ export default function Navbar({
             onClick={onExportCSV}
             disabled={measurementsCount === 0}
             title="Descargar historial completo en archivo CSV"
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-teal-600 hover:bg-teal-500 active:scale-95 text-white text-xs font-semibold shadow-glow-teal transition-all disabled:opacity-40 disabled:cursor-not-allowed disabled:pointer-events-none"
+            className="hidden sm:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-300 hover:text-white text-xs font-medium transition-all disabled:opacity-40 disabled:cursor-not-allowed"
           >
-            <Download className="w-3.5 h-3.5" />
-            <span className="hidden md:inline">Exportar CSV</span>
+            <Download className="w-3.5 h-3.5 text-teal-400" />
+            <span className="hidden lg:inline text-[11px]">CSV</span>
           </button>
+
+          {/* Authentication State: User Info & Logout or Login Button */}
+          {supabaseUser ? (
+            <div className="flex items-center gap-1.5 pl-1 sm:pl-2 border-l border-slate-800">
+              {/* User email badge */}
+              <div 
+                title={`Sesión iniciada como: ${supabaseUser.email}`}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700/80 text-xs text-slate-200 max-w-[150px] sm:max-w-[190px]"
+              >
+                <div className="w-2 h-2 rounded-full bg-emerald-400 shrink-0"></div>
+                <span className="truncate text-[11px] font-medium">{supabaseUser.email}</span>
+              </div>
+
+              {/* Logout Button */}
+              <button
+                onClick={onSignOut}
+                title="Cerrar Sesión"
+                className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 border border-rose-500/30 text-xs font-semibold transition-all hover:border-rose-500/50"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline text-[11px]">Salir</span>
+              </button>
+            </div>
+          ) : (
+            <button
+              onClick={onOpenAuth}
+              title="Iniciar sesión o registrarte con Supabase Auth"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-teal-500 hover:bg-teal-400 active:scale-95 text-slate-950 text-xs font-bold shadow-glow-teal transition-all"
+            >
+              <LogIn className="w-3.5 h-3.5 stroke-[2.5]" />
+              <span>Acceder</span>
+            </button>
+          )}
 
         </div>
 

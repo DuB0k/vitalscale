@@ -29,6 +29,14 @@ export function getActiveConfig() {
 }
 
 /**
+ * Checks if Supabase credentials are configured
+ */
+export function isSupabaseConfigured() {
+  const config = getActiveConfig();
+  return Boolean(config.url && config.anonKey);
+}
+
+/**
  * Returns an initialized Supabase client, or null if unconfigured
  */
 export function getSupabase() {
@@ -49,7 +57,8 @@ export function getSupabase() {
         auth: {
           persistSession: true,
           autoRefreshToken: true,
-          detectSessionInUrl: true
+          detectSessionInUrl: true,
+          storage: window.localStorage
         }
       });
       currentConfig = { url: config.url, anonKey: config.anonKey };
@@ -111,7 +120,6 @@ export async function testSupabaseConnection(testUrl, testKey) {
     const { error } = await testClient.from('body_measurements').select('id').limit(1);
 
     if (error && error.code !== 'PGRST116' && !error.message.includes('relation "public.body_measurements" does not exist')) {
-      // If error is just that table doesn't exist yet, connection is still valid
       if (error.code === '42P01') {
         return { 
           success: true, 
@@ -129,9 +137,152 @@ export async function testSupabaseConnection(testUrl, testKey) {
 }
 
 /**
- * SQL Schema script snippet for user reference
+ * Supabase Auth API Helpers
  */
-export const SUPABASE_SQL_SETUP = `-- 1. Tabla de Perfil de Usuario
+export async function signUpUser(email, password, userMetadata = {}) {
+  const client = getSupabase();
+  if (!client) throw new Error('Supabase no está configurado. Conéctalo primero.');
+  
+  const { data, error } = await client.auth.signUp({
+    email,
+    password,
+    options: {
+      data: userMetadata
+    }
+  });
+
+  if (error) throw error;
+  return data;
+}
+
+export async function signInUser(email, password) {
+  const client = getSupabase();
+  if (!client) throw new Error('Supabase no está configurado. Conéctalo primero.');
+
+  const { data, error } = await client.auth.signInWithPassword({
+    email,
+    password
+  });
+
+  if (error) throw error;
+  return data;
+}
+
+export async function signOutUser() {
+  const client = getSupabase();
+  if (client) {
+    const { error } = await client.auth.signOut();
+    if (error) throw error;
+  }
+}
+
+/**
+ * Profile & Measurements DB queries strictly isolated by user_id
+ */
+export async function fetchUserProfile(userId) {
+  const client = getSupabase();
+  if (!client || !userId) return null;
+
+  const { data, error } = await client
+    .from('profiles')
+    .select('*')
+    .eq('id', userId)
+    .maybeSingle();
+
+  if (error) {
+    console.warn('Error fetching user profile:', error.message);
+    return null;
+  }
+
+  return data;
+}
+
+export async function upsertUserProfile(userId, profileData) {
+  const client = getSupabase();
+  if (!client || !userId) return null;
+
+  const payload = {
+    id: userId,
+    height_cm: profileData.heightCm,
+    target_weight: profileData.targetWeight,
+    target_waist: profileData.targetWaist,
+    updated_at: new Date().toISOString()
+  };
+
+  const { data, error } = await client
+    .from('profiles')
+    .upsert(payload)
+    .select()
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+export async function fetchUserMeasurements(userId) {
+  const client = getSupabase();
+  if (!client || !userId) return [];
+
+  const { data, error } = await client
+    .from('body_measurements')
+    .select('*')
+    .eq('user_id', userId)
+    .order('date', { ascending: true });
+
+  if (error) {
+    console.warn('Error fetching user measurements:', error.message);
+    throw error;
+  }
+
+  return (data || []).map(r => ({
+    id: r.id,
+    date: r.date,
+    weight: Number(r.weight),
+    waist: Number(r.waist),
+    notes: r.notes || ''
+  }));
+}
+
+export async function upsertUserMeasurement(userId, measurement) {
+  const client = getSupabase();
+  if (!client || !userId) return null;
+
+  const payload = {
+    id: measurement.id,
+    user_id: userId,
+    date: measurement.date,
+    weight: measurement.weight,
+    waist: measurement.waist,
+    notes: measurement.notes || ''
+  };
+
+  const { data, error } = await client
+    .from('body_measurements')
+    .upsert(payload)
+    .select()
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+export async function deleteUserMeasurement(userId, measurementId) {
+  const client = getSupabase();
+  if (!client || !userId) return;
+
+  const { error } = await client
+    .from('body_measurements')
+    .delete()
+    .eq('id', measurementId)
+    .eq('user_id', userId);
+
+  if (error) throw error;
+}
+
+/**
+ * SQL Schema script snippet for user reference with strict Row Level Security (RLS)
+ */
+export const SUPABASE_SQL_SETUP = `-- 1. Tabla de Perfiles de Usuario (vinculada al ID de autenticación)
 CREATE TABLE IF NOT EXISTS public.profiles (
   id UUID REFERENCES auth.users ON DELETE CASCADE PRIMARY KEY,
   height_cm NUMERIC DEFAULT 175,
@@ -140,18 +291,17 @@ CREATE TABLE IF NOT EXISTS public.profiles (
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
 );
 
--- Habilitar RLS en profiles
+-- Habilitar Row Level Security (RLS) en profiles
 ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
 
-CREATE POLICY "Los usuarios pueden ver su propio perfil" 
-  ON public.profiles FOR SELECT 
-  USING (auth.uid() = id);
+DROP POLICY IF EXISTS "Los usuarios pueden gestionar su propio perfil" ON public.profiles;
 
-CREATE POLICY "Los usuarios pueden insertar/actualizar su propio perfil" 
+CREATE POLICY "Los usuarios pueden gestionar su propio perfil" 
   ON public.profiles FOR ALL 
-  USING (auth.uid() = id);
+  USING (auth.uid() = id)
+  WITH CHECK (auth.uid() = id);
 
--- 2. Tabla de Medidas Corporales
+-- 2. Tabla de Medidas Corporales (estrictamente aislada por user_id)
 CREATE TABLE IF NOT EXISTS public.body_measurements (
   id TEXT PRIMARY KEY,
   user_id UUID REFERENCES auth.users ON DELETE CASCADE NOT NULL,
@@ -162,13 +312,16 @@ CREATE TABLE IF NOT EXISTS public.body_measurements (
   created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
 );
 
--- Habilitar RLS en body_measurements
+-- Habilitar Row Level Security (RLS) en body_measurements
 ALTER TABLE public.body_measurements ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Los usuarios pueden gestionar sus propias medidas" ON public.body_measurements;
 
 CREATE POLICY "Los usuarios pueden gestionar sus propias medidas" 
   ON public.body_measurements FOR ALL 
-  USING (auth.uid() = user_id);
+  USING (auth.uid() = user_id)
+  WITH CHECK (auth.uid() = user_id);
 
--- Crear índice para ordenación eficiente por fecha
+-- Índices de alto rendimiento para consultas por usuario y fecha
 CREATE INDEX IF NOT EXISTS idx_measurements_user_date ON public.body_measurements (user_id, date DESC);
 `;

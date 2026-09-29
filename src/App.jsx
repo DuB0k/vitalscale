@@ -8,20 +8,31 @@ import HistoryTable from './components/HistoryTable';
 import ProfileModal from './components/ProfileModal';
 import EditMeasurementModal from './components/EditMeasurementModal';
 import SupabaseModal from './components/SupabaseModal';
+import AuthModal from './components/AuthModal';
 import Toast from './components/Toast';
 
 import { computeHealthStats } from './utils/healthCalculations';
 import { exportToCSV } from './utils/csvExport';
 import { DEFAULT_HEIGHT_CM, SAMPLE_MEASUREMENTS } from './data/initialData';
-import { getSupabase, getActiveConfig } from './lib/supabase';
-import { Sparkles, Trash2, ShieldCheck, Heart } from 'lucide-react';
+import { 
+  getSupabase, 
+  getActiveConfig,
+  signUpUser,
+  signInUser,
+  signOutUser,
+  fetchUserProfile,
+  upsertUserProfile,
+  fetchUserMeasurements,
+  upsertUserMeasurement,
+  deleteUserMeasurement
+} from './lib/supabase';
+import { Sparkles, Trash2, ShieldCheck, Heart, User, LogIn, Lock, CheckCircle2 } from 'lucide-react';
 
 const STORAGE_KEYS = {
   HEIGHT: 'vitalscale_height',
   TARGET_WEIGHT: 'vitalscale_target_weight',
   TARGET_WAIST: 'vitalscale_target_waist',
   MEASUREMENTS: 'vitalscale_measurements',
-  HAS_SEEDED: 'vitalscale_seeded_v1'
 };
 
 export default function App() {
@@ -51,13 +62,13 @@ export default function App() {
         return SAMPLE_MEASUREMENTS;
       }
     }
-    // Seed initial demo data so application is immediately visual and ready
     return SAMPLE_MEASUREMENTS;
   });
 
   // Modals & UI state
   const [isProfileModalOpen, setIsProfileModalOpen] = useState(false);
   const [isSupabaseModalOpen, setIsSupabaseModalOpen] = useState(false);
+  const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [editingMeasurement, setEditingMeasurement] = useState(null);
   const [toast, setToast] = useState(null);
   const [isSyncing, setIsSyncing] = useState(false);
@@ -73,13 +84,54 @@ export default function App() {
     }, 3500);
   }, []);
 
-  // Save measurements to localStorage whenever they change
+  // Save measurements to localStorage (user-isolated when logged in)
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.MEASUREMENTS, JSON.stringify(measurements));
-  }, [measurements]);
+    if (supabaseUser) {
+      localStorage.setItem(`vitalscale_measurements_${supabaseUser.id}`, JSON.stringify(measurements));
+    } else {
+      localStorage.setItem(STORAGE_KEYS.MEASUREMENTS, JSON.stringify(measurements));
+    }
+  }, [measurements, supabaseUser]);
 
-  // Check Supabase connection and user session
-  const checkSupabaseStatus = useCallback(async () => {
+  // Load user data from Supabase (strictly isolated by user_id)
+  const loadUserData = useCallback(async (user) => {
+    if (!user) return;
+    try {
+      // 1. Fetch user's private profile
+      const profile = await fetchUserProfile(user.id);
+      if (profile) {
+        if (profile.height_cm) {
+          setHeightCm(Number(profile.height_cm));
+          localStorage.setItem(`vitalscale_height_${user.id}`, String(profile.height_cm));
+        }
+        if (profile.target_weight !== null && profile.target_weight !== undefined) {
+          setTargetWeight(Number(profile.target_weight));
+        } else {
+          setTargetWeight(null);
+        }
+        if (profile.target_waist !== null && profile.target_waist !== undefined) {
+          setTargetWaist(Number(profile.target_waist));
+        } else {
+          setTargetWaist(null);
+        }
+      } else {
+        // If profile doesn't exist, create it from metadata
+        const initialH = user.user_metadata?.height_cm || heightCm || DEFAULT_HEIGHT_CM;
+        await upsertUserProfile(user.id, { heightCm: initialH, targetWeight: null, targetWaist: null });
+        setHeightCm(initialH);
+      }
+
+      // 2. Fetch user's private measurements
+      const userRecords = await fetchUserMeasurements(user.id);
+      setMeasurements(userRecords);
+      localStorage.setItem(`vitalscale_measurements_${user.id}`, JSON.stringify(userRecords));
+    } catch (err) {
+      console.error('Error loading private user data:', err);
+    }
+  }, [heightCm]);
+
+  // Subscribe to Supabase Auth state changes
+  useEffect(() => {
     const client = getSupabase();
     if (!client) {
       setIsSupabaseConnected(false);
@@ -87,22 +139,34 @@ export default function App() {
       return;
     }
 
-    try {
-      const { data, error } = await client.auth.getSession();
-      if (!error && data?.session?.user) {
-        setSupabaseUser(data.session.user);
-      } else {
-        setSupabaseUser(null);
-      }
-      setIsSupabaseConnected(true);
-    } catch {
-      setIsSupabaseConnected(false);
-    }
-  }, []);
+    setIsSupabaseConnected(true);
 
-  useEffect(() => {
-    checkSupabaseStatus();
-  }, [checkSupabaseStatus]);
+    // Initial session check
+    client.auth.getSession().then(({ data }) => {
+      if (data?.session?.user) {
+        setSupabaseUser(data.session.user);
+        loadUserData(data.session.user);
+      }
+    });
+
+    // Reactive Auth listener
+    const { data: { subscription } } = client.auth.onAuthStateChange(async (event, session) => {
+      if (event === 'SIGNED_IN' && session?.user) {
+        setSupabaseUser(session.user);
+        await loadUserData(session.user);
+      } else if (event === 'SIGNED_OUT') {
+        setSupabaseUser(null);
+        const localSaved = localStorage.getItem(STORAGE_KEYS.MEASUREMENTS);
+        setMeasurements(localSaved ? JSON.parse(localSaved) : SAMPLE_MEASUREMENTS);
+        const localH = localStorage.getItem(STORAGE_KEYS.HEIGHT);
+        setHeightCm(localH ? parseInt(localH, 10) : DEFAULT_HEIGHT_CM);
+      }
+    });
+
+    return () => {
+      subscription?.unsubscribe();
+    };
+  }, [loadUserData]);
 
   // Sorted measurements for stats and last entry
   const sortedChronological = useMemo(() => {
@@ -119,7 +183,6 @@ export default function App() {
   // Add new measurement
   const handleAddMeasurement = async (newEntry) => {
     setMeasurements((prev) => {
-      // Check if entry for same date exists, update it or append
       const existingIdx = prev.findIndex((m) => m.date === newEntry.date);
       if (existingIdx !== -1) {
         const updated = [...prev];
@@ -129,21 +192,12 @@ export default function App() {
       return [...prev, newEntry];
     });
 
-    showToast('Registro de peso y cintura guardado correctamente');
+    showToast('Registro de peso y cintura guardado');
 
-    // Cloud sync if connected
-    const client = getSupabase();
-    if (client) {
+    // Cloud sync strictly isolated by user_id
+    if (supabaseUser) {
       try {
-        const { error } = await client.from('body_measurements').upsert({
-          id: newEntry.id,
-          user_id: supabaseUser?.id || '00000000-0000-0000-0000-000000000000',
-          date: newEntry.date,
-          weight: newEntry.weight,
-          waist: newEntry.waist,
-          notes: newEntry.notes || ''
-        });
-        if (error) console.warn('Supabase sync warning:', error.message);
+        await upsertUserMeasurement(supabaseUser.id, newEntry);
       } catch (err) {
         console.warn('Could not sync entry to Supabase:', err);
       }
@@ -158,18 +212,9 @@ export default function App() {
 
     showToast('Registro de medida actualizado correctamente');
 
-    // Cloud sync if connected
-    const client = getSupabase();
-    if (client) {
+    if (supabaseUser) {
       try {
-        await client.from('body_measurements').upsert({
-          id: updatedEntry.id,
-          user_id: supabaseUser?.id || '00000000-0000-0000-0000-000000000000',
-          date: updatedEntry.date,
-          weight: updatedEntry.weight,
-          waist: updatedEntry.waist,
-          notes: updatedEntry.notes || ''
-        });
+        await upsertUserMeasurement(supabaseUser.id, updatedEntry);
       } catch (err) {
         console.warn('Could not update in Supabase:', err);
       }
@@ -181,20 +226,24 @@ export default function App() {
     setMeasurements((prev) => prev.filter((m) => m.id !== id));
     showToast('Registro eliminado', 'info');
 
-    const client = getSupabase();
-    if (client) {
+    if (supabaseUser) {
       try {
-        await client.from('body_measurements').delete().eq('id', id);
+        await deleteUserMeasurement(supabaseUser.id, id);
       } catch (err) {
         console.warn('Could not delete from Supabase:', err);
       }
     }
   };
 
-  // Save profile info
+  // Save profile info (height, target weight, target waist)
   const handleSaveProfile = async (profileData) => {
     setHeightCm(profileData.heightCm);
-    localStorage.setItem(STORAGE_KEYS.HEIGHT, String(profileData.heightCm));
+    
+    if (supabaseUser) {
+      localStorage.setItem(`vitalscale_height_${supabaseUser.id}`, String(profileData.heightCm));
+    } else {
+      localStorage.setItem(STORAGE_KEYS.HEIGHT, String(profileData.heightCm));
+    }
 
     if (profileData.targetWeight !== undefined) {
       setTargetWeight(profileData.targetWeight);
@@ -214,19 +263,11 @@ export default function App() {
       }
     }
 
-    showToast('Perfil y altura actualizados. IMC recalculado.');
+    showToast('Perfil y estatura actualizados. IMC recalculado.');
 
-    // Save to Supabase profile table if connected and logged in
-    const client = getSupabase();
-    if (client && supabaseUser) {
+    if (supabaseUser) {
       try {
-        await client.from('profiles').upsert({
-          id: supabaseUser.id,
-          height_cm: profileData.heightCm,
-          target_weight: profileData.targetWeight,
-          target_waist: profileData.targetWaist,
-          updated_at: new Date().toISOString()
-        });
+        await upsertUserProfile(supabaseUser.id, profileData);
       } catch (err) {
         console.warn('Could not sync profile to Supabase:', err);
       }
@@ -244,67 +285,39 @@ export default function App() {
   };
 
   // Import from CSV
-  const handleImportMeasurements = (imported) => {
+  const handleImportMeasurements = async (imported) => {
     setMeasurements((prev) => {
-      // Merge unique by date
       const dateMap = new Map();
       prev.forEach((item) => dateMap.set(item.date, item));
       imported.forEach((item) => dateMap.set(item.date, item));
       return Array.from(dateMap.values());
     });
+
+    if (supabaseUser) {
+      try {
+        for (const item of imported) {
+          await upsertUserMeasurement(supabaseUser.id, item);
+        }
+      } catch (err) {
+        console.warn('Could not sync imported records to Supabase:', err);
+      }
+    }
+
     showToast(`Se han importado ${imported.length} registros exitosamente`);
   };
 
-  // Manual Supabase bidirectional sync
+  // Manual Supabase sync
   const handleSyncData = async () => {
-    const client = getSupabase();
-    if (!client) {
-      showToast('Configura Supabase primero', 'error');
+    if (!supabaseUser) {
+      showToast('Inicia sesión para sincronizar tus medidas en la nube', 'info');
+      setIsAuthModalOpen(true);
       return;
     }
 
     setIsSyncing(true);
     try {
-      // 1. Fetch remote measurements
-      const { data: remoteRecords, error: fetchErr } = await client
-        .from('body_measurements')
-        .select('*');
-
-      if (fetchErr) throw fetchErr;
-
-      // 2. Merge local and remote
-      const map = new Map();
-      measurements.forEach((m) => map.set(m.id || m.date, m));
-
-      if (remoteRecords && remoteRecords.length > 0) {
-        remoteRecords.forEach((r) => {
-          map.set(r.id || r.date, {
-            id: r.id,
-            date: r.date,
-            weight: Number(r.weight),
-            waist: Number(r.waist),
-            notes: r.notes || ''
-          });
-        });
-      }
-
-      const merged = Array.from(map.values());
-      setMeasurements(merged);
-
-      // 3. Push any local records that weren't in remote
-      if (supabaseUser) {
-        const payload = merged.map((m) => ({
-          id: m.id,
-          user_id: supabaseUser.id,
-          date: m.date,
-          weight: m.weight,
-          waist: m.waist,
-          notes: m.notes || ''
-        }));
-        await client.from('body_measurements').upsert(payload);
-      }
-
-      showToast('Sincronización completada con Supabase');
+      await loadUserData(supabaseUser);
+      showToast('Sincronización completada con tu cuenta privada');
     } catch (err) {
       showToast(err.message || 'Error durante la sincronización', 'error');
     } finally {
@@ -312,30 +325,47 @@ export default function App() {
     }
   };
 
-  // Supabase Auth actions
+  // Supabase Auth Actions
   const handleAuthSignIn = async (email, password) => {
-    const client = getSupabase();
-    if (!client) throw new Error('Cliente Supabase no configurado');
-    const { data, error } = await client.auth.signInWithPassword({ email, password });
-    if (error) throw error;
-    setSupabaseUser(data.user);
-    showToast(`Bienvenido, ${data.user.email}`);
+    const data = await signInUser(email, password);
+    if (data?.user) {
+      setSupabaseUser(data.user);
+      await loadUserData(data.user);
+      showToast(`¡Bienvenido de nuevo, ${data.user.email}!`);
+    }
   };
 
-  const handleAuthSignUp = async (email, password) => {
-    const client = getSupabase();
-    if (!client) throw new Error('Cliente Supabase no configurado');
-    const { data, error } = await client.auth.signUp({ email, password });
-    if (error) throw error;
-    showToast('Cuenta creada con éxito.');
-    if (data.user) setSupabaseUser(data.user);
+  const handleAuthSignUp = async (email, password, initialHeight) => {
+    const data = await signUpUser(email, password, { height_cm: initialHeight });
+    if (data?.user) {
+      setSupabaseUser(data.user);
+      try {
+        await upsertUserProfile(data.user.id, {
+          heightCm: initialHeight,
+          targetWeight: null,
+          targetWaist: null
+        });
+      } catch (err) {
+        console.warn('Could not initialize profile:', err);
+      }
+      setHeightCm(initialHeight);
+      setMeasurements([]);
+      localStorage.setItem(`vitalscale_measurements_${data.user.id}`, JSON.stringify([]));
+      showToast('¡Cuenta creada! Tu espacio personal está listo.');
+    }
   };
 
   const handleAuthSignOut = async () => {
-    const client = getSupabase();
-    if (client) await client.auth.signOut();
+    try {
+      await signOutUser();
+    } catch (err) {
+      console.warn(err);
+    }
     setSupabaseUser(null);
-    showToast('Sesión cerrada');
+    const localSaved = localStorage.getItem(STORAGE_KEYS.MEASUREMENTS);
+    setMeasurements(localSaved ? JSON.parse(localSaved) : SAMPLE_MEASUREMENTS);
+    setHeightCm(DEFAULT_HEIGHT_CM);
+    showToast('Has cerrado la sesión correctamente');
   };
 
   // Reset demo data helper
@@ -354,6 +384,9 @@ export default function App() {
     }
   };
 
+  const activeConfig = getActiveConfig();
+  const isSupabaseConfigured = Boolean(activeConfig.url && activeConfig.anonKey);
+
   return (
     <div className="min-h-screen flex flex-col bg-slate-950 text-slate-100 selection:bg-teal-500/30 selection:text-teal-200">
       
@@ -364,6 +397,8 @@ export default function App() {
         onOpenSupabase={() => setIsSupabaseModalOpen(true)}
         isSupabaseConnected={isSupabaseConnected}
         supabaseUser={supabaseUser}
+        onOpenAuth={() => setIsAuthModalOpen(true)}
+        onSignOut={handleAuthSignOut}
         onExportCSV={handleExportCSV}
         measurementsCount={measurements.length}
       />
@@ -371,7 +406,50 @@ export default function App() {
       {/* Main Container */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-8 space-y-6 sm:space-y-8">
         
-        {/* Hero Section / Welcome Banner */}
+        {/* User Space Banner / Status Callout */}
+        {supabaseUser ? (
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 px-5 py-3 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 animate-fade-in">
+            <div className="flex items-center gap-2.5 text-xs text-emerald-300">
+              <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+              <span>
+                Espacio privado y autenticado: <strong className="text-white">{supabaseUser.email}</strong>. Todos los datos están aislados bajo tu identificador personal.
+              </span>
+            </div>
+            <div className="flex items-center gap-2 self-end sm:self-auto">
+              <button
+                onClick={handleSyncData}
+                disabled={isSyncing}
+                className="text-[11px] font-bold px-2.5 py-1 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 text-emerald-200 transition-all"
+              >
+                {isSyncing ? 'Sincronizando...' : 'Sincronizar'}
+              </button>
+              <button
+                onClick={handleAuthSignOut}
+                className="text-[11px] font-medium text-rose-300 hover:text-rose-200 hover:underline px-2 py-1"
+              >
+                Cerrar sesión
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 px-5 py-3.5 rounded-2xl bg-slate-900/90 border border-slate-800 animate-fade-in">
+            <div className="flex items-center gap-2.5 text-xs text-slate-300">
+              <Lock className="w-4 h-4 text-teal-400 shrink-0" />
+              <span>
+                Estás en <strong>Modo Local</strong>. Para guardar y proteger tus medidas en tu espacio privado en la nube, inicia sesión o crea tu cuenta.
+              </span>
+            </div>
+            <button
+              onClick={() => setIsAuthModalOpen(true)}
+              className="text-xs font-bold px-3.5 py-1.5 rounded-xl bg-teal-500 hover:bg-teal-400 text-slate-950 shadow-glow-teal transition-all flex items-center gap-1.5 self-start sm:self-auto shrink-0"
+            >
+              <LogIn className="w-3.5 h-3.5 stroke-[2.5]" />
+              <span>Iniciar Sesión / Registro</span>
+            </button>
+          </div>
+        )}
+
+        {/* Hero Section */}
         <section className="flex flex-col md:flex-row md:items-center justify-between gap-4 p-6 rounded-3xl glass-panel relative overflow-hidden">
           <div className="absolute top-0 right-0 w-80 h-80 bg-gradient-to-bl from-teal-500/10 via-cyan-500/5 to-transparent rounded-full blur-3xl pointer-events-none"></div>
           
@@ -504,12 +582,21 @@ export default function App() {
             <span>•</span>
             <span>Recharts</span>
             <span>•</span>
-            <span>Supabase Ready</span>
+            <span>Supabase Auth & DB</span>
           </div>
         </div>
       </footer>
 
       {/* Modals & Overlays */}
+      <AuthModal
+        isOpen={isAuthModalOpen}
+        onClose={() => setIsAuthModalOpen(false)}
+        isSupabaseConfigured={isSupabaseConfigured}
+        onOpenSupabaseConfig={() => setIsSupabaseModalOpen(true)}
+        onSignIn={handleAuthSignIn}
+        onSignUp={handleAuthSignUp}
+      />
+
       <ProfileModal
         isOpen={isProfileModalOpen}
         onClose={() => setIsProfileModalOpen(false)}
@@ -531,7 +618,18 @@ export default function App() {
         isOpen={isSupabaseModalOpen}
         onClose={() => setIsSupabaseModalOpen(false)}
         isSupabaseConnected={isSupabaseConnected}
-        onConfigUpdated={checkSupabaseStatus}
+        onConfigUpdated={() => {
+          const client = getSupabase();
+          if (client) {
+            setIsSupabaseConnected(true);
+            client.auth.getSession().then(({ data }) => {
+              if (data?.session?.user) {
+                setSupabaseUser(data.session.user);
+                loadUserData(data.session.user);
+              }
+            });
+          }
+        }}
         onSyncData={handleSyncData}
         isSyncing={isSyncing}
         supabaseUser={supabaseUser}
